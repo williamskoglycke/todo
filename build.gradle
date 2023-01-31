@@ -1,0 +1,230 @@
+buildscript {
+	repositories {
+		mavenLocal()
+		mavenCentral()
+	}
+	dependencies {
+		classpath 'mysql:mysql-connector-java:8.0.31'
+		classpath 'org.flywaydb:flyway-mysql:9.6.0'
+	}
+}
+
+plugins {
+	id 'java'
+	id 'jacoco'
+	id 'org.springframework.boot' version "${springBootVersion}"
+	id 'io.spring.dependency-management' version '1.1.0'
+	id 'org.flywaydb.flyway' version '9.6.0'
+	id 'nu.studer.jooq' version '8.0'
+	id "com.avast.gradle.docker-compose" version "0.14.9"
+}
+
+configurations {
+	flywayMigration
+}
+
+group = 'se.skoglycke'
+version = '0.0.1'
+sourceCompatibility = '19'
+
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(17)
+	}
+}
+
+dependencies {
+	implementation 'org.springframework.boot:spring-boot-starter-actuator'
+	implementation 'org.springframework.boot:spring-boot-starter-jooq'
+	implementation 'org.springframework.boot:spring-boot-starter-validation'
+	implementation 'org.springframework.boot:spring-boot-starter-rsocket'
+	implementation 'org.springframework.boot:spring-boot-starter-webflux'
+	implementation 'org.springframework.retry:spring-retry'
+
+	implementation 'org.flywaydb:flyway-core:8.5.10'
+	implementation 'org.flywaydb:flyway-mysql:8.5.10'
+
+	implementation 'org.springdoc:springdoc-openapi-ui:1.6.9'
+
+	runtimeOnly 'com.mysql:mysql-connector-j:8.0.31'
+
+	testImplementation 'org.springframework.boot:spring-boot-starter-test'
+	testImplementation 'io.projectreactor:reactor-test'
+
+	testImplementation 'org.testcontainers:junit-jupiter'
+	testImplementation 'org.testcontainers:mysql:1.17.5'
+
+	flywayMigration 'com.mysql:mysql-connector-j:8.0.31'
+	jooqGenerator 'mysql:mysql-connector-java:8.0.31'
+	jooqGenerator 'jakarta.xml.bind:jakarta.xml.bind-api:4.0.0'
+}
+
+dockerCompose {
+	useComposeFiles = ['docker-compose.build.yml']
+	startedServices = ['jooq']
+	projectName = "todo-gradle"
+	stopContainers = true
+	removeContainers = true
+	removeOrphans = true
+	forceRecreate = false
+
+	ext.port = "39999"
+	ext.database = "todo"
+	ext.user = "root"
+}
+
+flyway {
+	configurations = ['flywayMigration']
+	url = "jdbc:mysql://localhost:${dockerCompose.port}/${dockerCompose.database}"
+	user = dockerCompose.user
+}
+
+jooq {
+	configurations {
+		main {
+			generationTool {
+				logging = org.jooq.meta.jaxb.Logging.WARN
+				jdbc {
+					driver = 'com.mysql.cj.jdbc.Driver'
+					url = "jdbc:mysql://localhost:${dockerCompose.port}/${dockerCompose.database}"
+					user = dockerCompose.user
+				}
+				generator {
+					database {
+						name = 'org.jooq.meta.mysql.MySQLDatabase'
+						includes = '.*'
+						excludes = '.*information_schema.*'
+						inputSchema = dockerCompose.database
+						outputSchemaToDefault = true
+						forcedTypes {
+							forcedType {
+								userType = 'java.util.UUID'
+								includeExpression = '.*id$'
+								converter = 'se.skoglycke.todo.util.ByteArrayToUUIDConverter'
+							}
+						}
+					}
+					generate {
+						javaTimeTypes = true
+						records = true
+					}
+					target {
+						packageName = 'se.skoglycke.todo.jooq'
+					}
+					strategy.name = 'org.jooq.codegen.DefaultGeneratorStrategy'
+				}
+			}
+		}
+	}
+}
+
+test {
+	useJUnitPlatform()
+}
+
+bootJar {
+	manifest {
+		attributes 'Service-Name': rootProject.name
+		attributes 'Builder': 'Gradle ' + gradle.gradleVersion
+		attributes 'Build-System': buildInfo.system
+		attributes 'Build-Number': buildInfo.buildNumber
+		attributes 'Build-Time-UTC': new Date().format("yyyy-MM-dd HH:mm:ss", TimeZone.getTimeZone('UTC'))
+		attributes 'Git-Commit-Hash': getGitHash()
+	}
+}
+
+jar {
+	enabled = false
+}
+
+jacocoTestReport {
+	enabled = false
+}
+
+task buildProps(type: WriteProperties) {
+	description = "Write build.properties resource."
+	outputFile = file("${buildDir}/build.properties")
+	encoding = "UTF-8"
+
+	property("build.system", buildInfo.system)
+	property("build.number", buildInfo.buildNumber)
+	property("build.time-utc", new Date().format("yyyy-MM-dd HH:mm:ss", TimeZone.getTimeZone('UTC')))
+	property("build.git-commit-hash", gitHash)
+}
+
+processResources {
+	from buildProps
+}
+
+static def getBuildInfo() {
+	if (System.env.GITHUB_RUN_NUMBER?.trim()) {
+		return [
+				system: "GITHUB",
+				buildNumber: System.env.GITHUB_RUN_NUMBER
+		]
+	}
+	return [
+			system: "LOCAL",
+			buildNumber: 0
+	]
+}
+
+def getGitHash() {
+	def stdout = new ByteArrayOutputStream()
+	exec {
+		commandLine 'git', 'rev-parse', 'HEAD'
+		standardOutput = stdout
+	}
+	return stdout.toString().trim()
+}
+
+tasks.register('invalidateCacheOnFailure') {
+	ext.trigger = file("${buildDir}/generateJooqFailure")
+
+	onlyIf { tasks.any { it.state.failure != null } }
+	doLast {
+		ext.trigger.withWriter { w ->
+			w << new Date()
+		}
+	}
+}
+
+composeUp {
+	outputs.cacheIf { true }
+
+	inputs.files(generateJooq.inputs.files, invalidateCacheOnFailure.trigger)
+	outputs.dir(generateJooq.outputs.files)
+
+	finalizedBy composeDown
+}
+
+flywayMigrate {
+	dependsOn composeUp
+	outputs.cacheIf { true }
+
+	inputs.files(generateJooq.inputs.files, invalidateCacheOnFailure.trigger)
+	outputs.dir(generateJooq.outputs.files)
+
+	finalizedBy invalidateCacheOnFailure
+}
+
+generateJooq {
+	dependsOn composeUp
+	dependsOn flywayMigrate
+
+	// declare Flyway migration scripts as inputs on the jOOQ task
+	inputs.files(fileTree('src/main/resources/db/migration'))
+			.withPropertyName('migrations')
+			.withPathSensitivity(PathSensitivity.RELATIVE)
+
+	// make jOOQ task participate in incremental builds (and build caching)
+	allInputsDeclared = true
+
+	finalizedBy invalidateCacheOnFailure
+}
+
+composeDown {
+	dependsOn composeUp
+	mustRunAfter generateJooq
+	onlyIf { composeUp.didWork }
+}
